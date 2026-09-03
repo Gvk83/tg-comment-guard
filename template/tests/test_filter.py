@@ -490,3 +490,17 @@ def test_menu_does_not_duplicate_keyboard():
     assert words(inline) == {
         "Наблюдение", "Мягкий", "Боевой", "Приостановить", "Перезапустить",
     }
+
+
+def test_several_chats_are_supported():
+    """Один бот может обслуживать несколько чатов комментариев."""
+    from bot.config import Config, _ids
+
+    ids = _ids("-1001111111111, -1002222222222,-1003333333333")
+    assert ids == {-1001111111111, -1002222222222, -1003333333333}
+
+    cfg = Config(token="1:t", chat_ids=ids)
+    # Все три чата обслуживаются, посторонний — нет.
+    for chat_id in ids:
+        assert chat_id in cfg.chat_ids
+    assert -1009999999999 not in cfg.chat_ids
