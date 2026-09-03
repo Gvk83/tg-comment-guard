@@ -1,0 +1,25 @@
+[Unit]
+Description=Telegram spam moderator bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/moderator
+EnvironmentFile=/opt/moderator/.env
+ExecStart=/opt/moderator/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Ограничения безопасности
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/moderator
+
+[Install]
+WantedBy=multi-user.target
