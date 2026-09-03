@@ -68,7 +68,7 @@
 git clone --depth 1 https://github.com/Gvk83/tg-comment-guard /tmp/tcg && \
 for dir in ~/.claude/skills ~/.codex/skills; do \
   mkdir -p "$dir/telegram-comment-guard" && \
-  cp -R /tmp/tcg/skill/* /tmp/tcg/template "$dir/telegram-comment-guard/"; \
+  cp -R /tmp/tcg/skill/. /tmp/tcg/template "$dir/telegram-comment-guard/"; \
 done && rm -rf /tmp/tcg && echo "Навык установлен"
 ```
 
@@ -190,13 +190,13 @@ AGENTS.md         инструкция, которую агент читает �
 skill/
   ПРОМПТ.md       техническое задание для любого агента
   SKILL.md        навык для Claude Code и Codex
-  ЛОВУШКИ.md      11 подводных камней, найденных на практике
+  ЛОВУШКИ.md      15 подводных камней, найденных на практике
 template/         готовый код бота
   ЭКСПЛУАТАЦИЯ.md как запускать, останавливать, менять правила
 ```
 
 Python 3.10+, [aiogram 3](https://docs.aiogram.dev/), SQLite, systemd.
-Три зависимости, около 1500 строк, 64 автоматических теста. Без Docker,
+Три зависимости, около 1600 строк, 85 автоматических тестов. Без Docker,
 без внешних сервисов, без ИИ-классификаторов и платных API.
 
 ## Лицензия

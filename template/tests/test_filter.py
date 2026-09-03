@@ -11,7 +11,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bot.normalize import normalize, squash  # noqa: E402
 from bot.spamfilter import SpamFilter  # noqa: E402
 from bot.storage import Storage  # noqa: E402
-from tests.samples import CLEAN, SPAM, SPAM_OBFUSCATED  # noqa: E402
+from tests.samples import (  # noqa: E402
+    CLEAN,
+    CLEAN_TRICKY,
+    SPAM,
+    SPAM_NEW_WORDING,
+    SPAM_OBFUSCATED,
+)
 
 
 @pytest.fixture(scope="module")
@@ -504,3 +510,117 @@ def test_several_chats_are_supported():
     for chat_id in ids:
         assert chat_id in cfg.chat_ids
     assert -1009999999999 not in cfg.chat_ids
+
+
+def test_anonymous_admin_and_linked_channel_are_protected(tmp_path):
+    """Анонимный админ пишет от имени группы, канал — от имени канала.
+
+    В списке администраторов их нет, поэтому нужна отдельная проверка.
+    """
+    from bot.config import Config
+    from bot.main import Moderator
+
+    moderator = Moderator.__new__(Moderator)
+    moderator.cfg = Config(token="1:t", admin_id=777, whitelist_ids={42})
+    moderator._me_id = 999
+
+    chat_id, linked_id = -1001111111111, -1002222222222
+
+    # Анонимный админ: from_user = @GroupAnonymousBot, sender_chat = сама группа
+    assert moderator.is_protected(
+        1087968824, set(), sender_chat_id=chat_id,
+        chat_id=chat_id, linked_chat_id=linked_id,
+    ) is True
+
+    # Сообщение от имени связанного канала
+    assert moderator.is_protected(
+        None, set(), sender_chat_id=linked_id,
+        chat_id=chat_id, linked_chat_id=linked_id,
+    ) is True
+
+    # Служебный аккаунт Telegram
+    assert moderator.is_protected(777000, set()) is True
+
+    # А вот спам от имени ПОСТОРОННЕГО канала защищать не надо
+    assert moderator.is_protected(
+        None, set(), sender_chat_id=-1009999999999,
+        chat_id=chat_id, linked_chat_id=linked_id,
+    ) is False
+
+    # Обычный участник по-прежнему проверяется
+    assert moderator.is_protected(
+        123, {5, 6}, sender_chat_id=None,
+        chat_id=chat_id, linked_chat_id=linked_id,
+    ) is False
+
+
+# ------------------------------------- проверка на новых формулировках
+
+
+@pytest.mark.parametrize("text", SPAM_NEW_WORDING, ids=range(len(SPAM_NEW_WORDING)))
+def test_spam_with_unseen_wording(spam_filter, text):
+    """Фильтр не должен быть заточен под конкретные присланные тексты."""
+    verdict = spam_filter.check(text)
+    assert verdict.action != "none", f"пропущен спам ({verdict.score}): {text[:60]}"
+
+
+@pytest.mark.parametrize("text", CLEAN_TRICKY, ids=range(len(CLEAN_TRICKY)))
+def test_tricky_clean_messages_survive(spam_filter, text):
+    """Личные объявления и рассказы о покупках — не спам."""
+    verdict = spam_filter.check(text)
+    assert verdict.action == "none", f"ложное срабатывание ({verdict.reason_text}): {text[:60]}"
+
+
+def test_word_boundaries_are_respected(spam_filter):
+    """«заработался» — не «работа», «на смену масла» — не предложение работы."""
+    for text in (
+        "Я вчера заработался до ночи",
+        "Пора на смену масла записаться",
+        "Переработка отходов — интересная тема",
+        "Подработаю дома над проектом",
+    ):
+        v = spam_filter.check(text)
+        assert "предложение работы" not in v.reason_text, f"{text}: {v.reason_text}"
+
+
+def test_plain_link_is_not_a_context_signal(spam_filter):
+    """Обычная ссылка не должна снимать защиту от ложных срабатываний."""
+    v = spam_filter.check("Отдал за ремонт 45000 рублей, вот сайт https://remont.ru")
+    assert v.action == "none", v.reason_text
+    # А ссылка на Telegram-аккаунт — признак объявления.
+    v = spam_filter.check("Ищем сотрудников, 8000 за смену, пиши @somebody")
+    assert v.action == "ban"
+
+
+def test_squashed_search_only_for_obfuscated_text():
+    """Сжатый поиск включается только при подозрении на обход фильтра."""
+    from bot.normalize import looks_obfuscated, normalize
+
+    for text in ("Я вчера заработался до ночи", "Обычный текст про работу"):
+        assert looks_obfuscated(text, normalize(text)) is False
+    for text in ("р а б о т а удаленно", "рaб0тa без опыта", "Р\u200bА\u200bБ\u200bО\u200bТ\u200bА"):
+        assert looks_obfuscated(text, normalize(text)) is True
+
+
+def test_rights_check_warns_when_no_chats_configured():
+    """Раньше самоконтроль прав молча ничего не делал при пустом CHAT_IDS."""
+    import inspect
+    from bot import main as bot_main
+
+    source = inspect.getsource(bot_main.Moderator._check_rights)
+    assert "if not self.cfg.chat_ids" in source, "нет ветки для пустого списка чатов"
+    assert "_warn_once" in source
+
+
+def test_env_example_lists_every_setting():
+    """Каждая настройка из конфигурации должна быть описана в .env.example."""
+    from pathlib import Path
+
+    env = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    for key in (
+        "BOT_TOKEN", "CHAT_IDS", "MODE", "NOTIFY_ADMIN", "ADMIN_ID",
+        "WHITELIST_IDS", "DELETE_SERVICE_MESSAGES", "STORE_MESSAGE_TEXT",
+        "DAILY_REPORT_HOUR", "LOG_RETENTION_DAYS", "BLOCK_NEWCOMER_MEDIA",
+        "DB_PATH", "LOG_LEVEL",
+    ):
+        assert f"{key}=" in env, f"{key} не описан в .env.example"

@@ -34,6 +34,12 @@ log = logging.getLogger("moderator")
 
 ADMIN_CACHE_TTL = 300  # секунд
 
+# Служебные отправители Telegram, которых нельзя трогать.
+# 1087968824 — @GroupAnonymousBot: под этим id приходят сообщения анонимных
+# администраторов группы, в списке администраторов чата их нет.
+# 777000 — служебный аккаунт Telegram.
+SYSTEM_SENDERS = frozenset({1087968824, 777000})
+
 
 def user_id_or_none(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
@@ -74,6 +80,10 @@ BOT_COMMANDS = [
     BotCommand(command="unban", description="Разблокировать: /unban ID"),
     BotCommand(command="threshold", description="Пороги срабатывания"),
     BotCommand(command="addword", description="Добавить фразу в правила"),
+    BotCommand(command="delword", description="Убрать добавленную фразу"),
+    BotCommand(command="reload", description="Перечитать правила"),
+    BotCommand(command="delsample", description="Удалить образец: /delsample 5"),
+    BotCommand(command="purge", description="Стереть тексты из журнала"),
     BotCommand(command="media", description="Кружки и голосовые от новичков"),
     BotCommand(command="service", description="Сообщения о входе в группу"),
     BotCommand(command="help", description="Все команды"),
@@ -156,10 +166,24 @@ class Moderator:
         return self.cfg.admin_id is not None and message.from_user is not None \
             and message.from_user.id == self.cfg.admin_id
 
-    def is_protected(self, user_id: int | None, chat_admins: Iterable[int]) -> bool:
-        """Пользователи, которых бот не трогает ни при каких условиях."""
+    def is_protected(
+        self,
+        user_id: int | None,
+        chat_admins: Iterable[int],
+        *,
+        sender_chat_id: int | None = None,
+        chat_id: int | None = None,
+        linked_chat_id: int | None = None,
+    ) -> bool:
+        """Отправители, которых бот не трогает ни при каких условиях."""
+        # Анонимный администратор пишет от имени самой группы, а связанный
+        # канал — от имени канала. В списке администраторов их нет.
+        if sender_chat_id is not None and sender_chat_id in (chat_id, linked_chat_id):
+            return True
         if user_id is None:
             return False
+        if user_id in SYSTEM_SENDERS:
+            return True
         if user_id == self._me_id:
             return True
         if user_id == self.cfg.admin_id:
@@ -320,7 +344,13 @@ class Moderator:
 
         if self._me_id is None:
             self._me_id = (await self.bot.me()).id
-        if self.is_protected(user_id, await self._chat_admins(message.chat.id)):
+        if self.is_protected(
+            user_id,
+            await self._chat_admins(message.chat.id),
+            sender_chat_id=sender_chat_id,
+            chat_id=message.chat.id,
+            linked_chat_id=message.chat.linked_chat_id,
+        ):
             return
 
         norm = normalize(text)
@@ -939,6 +969,15 @@ class Moderator:
     async def _check_rights(self) -> None:
         """Проверяет, что боту не урезали права в чате."""
         if self._me_id is None:
+            return
+        if not self.cfg.chat_ids:
+            # Без списка чатов проверять нечего — предупредим об этом один раз.
+            await self._warn_once(
+                "no-chat-ids",
+                "⚠️ Не задан CHAT_IDS: бот работает во всех группах, куда его "
+                "добавили, и не может следить за своими правами.\n"
+                "Напишите /id в нужном чате и впишите его ID в настройки.",
+            )
             return
         for chat_id in self.cfg.chat_ids:
             try:

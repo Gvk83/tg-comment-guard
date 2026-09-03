@@ -43,6 +43,7 @@ async def main() -> int:
         return 1
 
     # Права в чатах
+    admin_everywhere = bool(cfg.chat_ids)
     if not cfg.chat_ids:
         report(WARN, "CHAT_IDS не задан", "бот работает во всех группах, куда добавлен")
     for chat_id in cfg.chat_ids:
@@ -50,9 +51,11 @@ async def main() -> int:
             member = await bot.get_chat_member(chat_id, me.id)
         except TelegramAPIError as e:
             report(FAIL, f"Чат {chat_id} недоступен", str(e))
+            admin_everywhere = False
             continue
         if member.status != "administrator":
             report(FAIL, f"Бот не администратор в чате {chat_id}", member.status)
+            admin_everywhere = False
             continue
         missing = [
             name for name, flag in (
@@ -65,15 +68,26 @@ async def main() -> int:
         else:
             report(OK, f"Права в чате {chat_id}", "удаление и блокировка есть")
 
-    # Режим приватности: без его отключения бот не видит обычные сообщения
-    if getattr(me, "can_read_all_group_messages", None) is False:
-        report(
-            FAIL, "Включён режим приватности",
-            "@BotFather → Bot Settings → Group Privacy → Turn off, "
-            "затем удалить и заново добавить бота в чат",
-        )
-    elif getattr(me, "can_read_all_group_messages", None) is True:
+    # Режим приватности. Администратор группы видит все сообщения и с включённым
+    # режимом — это исключение описано в документации Telegram. Но если права
+    # админа снимут, бот молча ослепнет, поэтому режим лучше выключить.
+    privacy_off = getattr(me, "can_read_all_group_messages", None)
+    if privacy_off is True:
         report(OK, "Режим приватности выключен", "бот видит все сообщения")
+    elif privacy_off is False:
+        if admin_everywhere:
+            report(
+                WARN, "Режим приватности включён",
+                "сейчас не мешает — администратор видит все сообщения, — но если "
+                "права админа снимут, бот перестанет видеть комментарии. "
+                "@BotFather → Bot Settings → Group Privacy → Turn off",
+            )
+        else:
+            report(
+                FAIL, "Включён режим приватности, а бот не администратор",
+                "бот не видит обычные сообщения. @BotFather → Bot Settings → "
+                "Group Privacy → Turn off, затем удалить и заново добавить бота в чат",
+            )
 
     # Уведомления владельцу
     if cfg.admin_id is None:

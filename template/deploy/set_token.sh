@@ -22,7 +22,7 @@ if [ -z "${TOKEN}" ] || [[ "${TOKEN}" != *:* ]]; then
     exit 1
 fi
 
-printf '%s' "$TOKEN" | ssh -i "$KEY" -o BatchMode=yes "$SERVER" '
+printf '%s\n' "$TOKEN" | ssh -i "$KEY" -o BatchMode=yes "$SERVER" '
     read -r T
     sed -i "s|^BOT_TOKEN=.*|BOT_TOKEN=${T}|" /opt/moderator/.env
     chmod 600 /opt/moderator/.env

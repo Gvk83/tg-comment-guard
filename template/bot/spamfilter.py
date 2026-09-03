@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from .normalize import normalize, squash
+from .normalize import looks_obfuscated, normalize, squash
 
 RULES_PATH = Path(__file__).with_name("rules.yml")
 
@@ -70,6 +70,7 @@ class SpamFilter:
             rules["thresholds"].update(custom.get("thresholds") or {})
             for group, words in (custom.get("patterns") or {}).items():
                 rules["patterns"].setdefault(group, []).extend(words)
+        self._word_cache: dict[str, re.Pattern] = {}
         self.thresholds = rules["thresholds"]
         self.scores = rules["scores"]
         self.patterns = {k: [normalize(p) for p in v] for k, v in rules["patterns"].items()}
@@ -85,18 +86,33 @@ class SpamFilter:
 
     # ------------------------------------------------------------------ поиск
 
-    def _find(self, group: str, norm: str, sq: str) -> tuple[bool, bool]:
+    def _find(self, group: str, norm: str, sq: str, obfuscated: bool) -> tuple[bool, bool]:
         """Возвращает (найдено, найдено_только_в_сжатом_виде).
 
-        Второй флаг означает, что слово было намеренно искажено.
+        Поиск идёт по границам слова: иначе «заработался» считается
+        словом «работа», а «на смену масла» — предложением работы.
+        Сжатый вид проверяем только у текстов, похожих на обход фильтра.
         """
         for phrase in self.patterns.get(group, ()):
-            if phrase in norm:
+            if self._word_re(phrase).search(norm):
                 return True, False
+        if not obfuscated:
+            return False, False
         for phrase in self.patterns.get(group, ()):
-            if squash(phrase) and squash(phrase) in sq:
+            squashed = squash(phrase)
+            if squashed and squashed in sq:
                 return True, True
         return False, False
+
+    def _word_re(self, phrase: str) -> re.Pattern:
+        """Фраза с границами слова по краям, с кэшем."""
+        cached = self._word_cache.get(phrase)
+        if cached is None:
+            cached = re.compile(
+                rf"(?<![0-9а-яa-z]){re.escape(phrase)}(?![0-9а-яa-z])"
+            )
+            self._word_cache[phrase] = cached
+        return cached
 
     def _money(self, norm: str) -> tuple[int, bool]:
         """Максимальная найденная сумма и признак «сумма за период»."""
@@ -144,6 +160,8 @@ class SpamFilter:
         if not norm:
             return v
         sq = squash(norm)
+        # Сжатый поиск включаем только при подозрении на обход фильтра.
+        may_be_obfuscated = looks_obfuscated(text, norm)
 
         obfuscated = False
         hit_context = False
@@ -170,7 +188,7 @@ class SpamFilter:
             ("send_material", "предлагает прислать материал в личные"),
             ("age_bait", "«без опыта» / возрастная приманка"),
         ):
-            found, only_squashed = self._find(group, norm, sq)
+            found, only_squashed = self._find(group, norm, sq, may_be_obfuscated)
             if found:
                 add(group, label)
                 obfuscated = obfuscated or only_squashed
@@ -183,9 +201,14 @@ class SpamFilter:
             hit_context = True
 
         # --- ссылки и контакты
-        if TELEGRAM_LINK_RE.search(norm) or URL_RE.search(norm):
-            add("telegram_link", "ссылка или username")
+        # Ссылка на Telegram-аккаунт или канал — сильный признак объявления.
+        # Обычная ссылка (магазин, статья) сама по себе ничего не значит
+        # и «контекстным» признаком не считается.
+        if TELEGRAM_LINK_RE.search(norm):
+            add("telegram_link", "ссылка на Telegram или username")
             hit_context = True
+        elif URL_RE.search(norm):
+            add("external_link", "внешняя ссылка")
 
         # Ссылка, спрятанная под текстом («подробности» с адресом внутри),
         # — приём, которым обычные участники почти не пользуются.
@@ -212,7 +235,7 @@ class SpamFilter:
             add("schedule", "рабочий график")
 
         # --- короткая заманка без деталей
-        if len(norm) < 70 and self._find("easy_money", norm, sq)[0]:
+        if len(norm) < 70 and self._find("easy_money", norm, sq, may_be_obfuscated)[0]:
             add("short_earn_pitch", "короткая заманка про заработок")
 
         if obfuscated:
@@ -221,6 +244,11 @@ class SpamFilter:
         if known_spam:
             add("known_spam", "совпало с сохранённым образцом спама")
             hit_context = True
+
+        # Личное объявление или рассказ о своей покупке — не спам,
+        # даже если там есть сумма и просьба написать в личку.
+        if self._find("personal_deal", norm, sq, may_be_obfuscated)[0]:
+            add("personal_deal", "личное объявление или рассказ о покупке")
 
         if is_duplicate:
             add("duplicate", "повтор недавнего сообщения")

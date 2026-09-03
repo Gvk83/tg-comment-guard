@@ -33,6 +33,28 @@ def normalize(text: str) -> str:
     return re.sub(r"\s*\n\s*", "\n", text).strip()
 
 
+# Признаки того, что текст намеренно исказили.
+LATIN_IN_CYRILLIC = re.compile(r"[а-я][a-z]|[a-z][а-я]")
+SPACED_LETTERS = re.compile(r"(?:(?<=\s)|^)[а-яa-z](?:\s[а-яa-z]){2,}")
+DIGIT_IN_WORD = re.compile(r"[а-я][0346][а-я]")
+
+
+def looks_obfuscated(original: str, normalized: str) -> bool:
+    """Текст похож на попытку обойти фильтр.
+
+    Только в этом случае имеет смысл искать слова в «сжатом» виде: там нет
+    границ слов, и обычный текст даёт ложные совпадения («заработался»
+    содержит «работа»).
+    """
+    if INVISIBLE.search(original):
+        return True
+    return bool(
+        LATIN_IN_CYRILLIC.search(normalized)
+        or SPACED_LETTERS.search(normalized)
+        or DIGIT_IN_WORD.search(normalized)
+    )
+
+
 def squash(normalized: str) -> str:
     """Сжатый вид: только буквы и цифры, латиница заменена на похожую кириллицу.
 
