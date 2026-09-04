@@ -109,7 +109,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
-        self._pending_sample: str = ""
+        self._pending: dict[str, object] = {}
         self._register()
 
     # ------------------------------------------------------------ маршруты
@@ -603,7 +603,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
-        self._pending_sample: str = ""
+        self._pending: dict[str, object] = {}
         return f"Режим: <b>{mode}</b> — {MODE_NAMES[mode]}\nНастройка сохранена."
 
     async def cmd_mode(self, message: Message) -> None:
@@ -634,7 +634,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
-        self._pending_sample: str = ""
+        self._pending: dict[str, object] = {}
         await message.answer("▶️ Проверка возобновлена.", reply_markup=self._menu())
 
     async def cmd_restart(self, message: Message) -> None:
@@ -990,19 +990,43 @@ class Moderator:
         origin = message.forward_origin
         author_id = getattr(getattr(origin, "sender_user", None), "id", None)
 
-        rows = [[InlineKeyboardButton(
-            text="🚫 Запомнить как спам", callback_data="remember_text"
-        )]]
-        if author_id and not self.is_protected(author_id, set()):
+        # Автор известен и его можно трогать — предложим сразу навести порядок.
+        can_act = bool(author_id) and not self.is_protected(author_id, set())
+        self._pending = {"text": text, "author_id": author_id if can_act else None}
+
+        if not self.cfg.may_delete:
+            main_button = "💾 Запомнить как спам"
+        elif not can_act:
+            main_button = "💾 Запомнить как спам"
+        elif self.cfg.may_ban:
+            main_button = "🚫 Спам — удалить и заблокировать"
+        else:
+            main_button = "🚫 Спам — запомнить и удалить"
+
+        rows = [[InlineKeyboardButton(text=main_button, callback_data="remember_text")]]
+        if can_act and self.cfg.may_delete:
             rows.append([InlineKeyboardButton(
-                text="🔨 Заблокировать автора", callback_data=f"banuser:{author_id}"
+                text="💾 Только запомнить, не трогать", callback_data="remember_only"
             )])
-        self._pending_sample = text
+
+        hint = ""
+        if not author_id:
+            hint = (
+                "\n\n<i>Автор скрыт при пересылке — удалить его сообщения "
+                "и заблокировать не смогу, только запомню образец.</i>"
+            )
+        elif not can_act:
+            hint = "\n\n<i>Этот отправитель защищён — трогать его не буду.</i>"
+        elif not self.cfg.may_delete:
+            hint = (
+                "\n\n<i>Режим наблюдения: запомню образец, но ничего "
+                "не удалю. Включить: ⚙️ Режим.</i>"
+            )
 
         await message.answer(
             f"Баллы: <b>{verdict.score}</b> из {delete_at} нужных\n"
             f"Решение: <b>{decision}</b>{gap}\n"
-            f"Признаки: {html.escape(verdict.reason_text)}",
+            f"Признаки: {html.escape(verdict.reason_text)}" + hint,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
@@ -1014,25 +1038,52 @@ class Moderator:
             return
         data = call.data or ""
 
-        if data == "remember_text":
-            text = getattr(self, "_pending_sample", "")
+        if data in ("remember_text", "remember_only"):
+            text = str(self._pending.get("text") or "")
             if not text:
                 await call.answer("Текст потерялся, пришлите заново", show_alert=True)
                 return
+
             added = self.store.add_sample(normalize(text), text)
-            await call.answer("Запомнил" if added else "Такой образец уже есть")
-            if added:
-                await call.message.answer(
-                    "🚫 Образец сохранён. Похожие сообщения теперь будут удаляться "
-                    f"сразу.\n\nВсего образцов: {self.store.count_samples()}\n"
-                    "Посмотреть: /samples"
+            lines = [
+                "🚫 Образец сохранён. Похожие сообщения теперь будут удаляться сразу."
+                if added else
+                "Такой образец уже был сохранён."
+            ]
+
+            author_id = self._pending.get("author_id")
+            # По кнопке «только запомнить» автора не трогаем.
+            if data == "remember_text" and author_id and self.cfg.may_delete:
+                removed, banned_ok = 0, False
+                for chat_id in self.cfg.chat_ids:
+                    removed += await self._delete_previous(chat_id, int(author_id), 0)
+                    if self.cfg.may_ban:
+                        try:
+                            await self.bot.ban_chat_member(
+                                chat_id, int(author_id), revoke_messages=True
+                            )
+                            banned_ok = True
+                            lines.append(f"Автор заблокирован в чате {chat_id}.")
+                        except TelegramAPIError as e:
+                            lines.append(f"Заблокировать не удалось: {html.escape(str(e))}")
+                lines.append(
+                    f"Удалено его сообщений: {removed}." if removed
+                    else "Других его сообщений за последние двое суток не нашлось."
                 )
-            else:
-                await call.message.answer(
-                    "Такой образец уже сохранён — похожие сообщения и так удаляются.\n"
-                    "Если это сообщение всё равно проходит, пришлите его мне, "
-                    "и я подскажу, какого признака не хватает."
-                )
+                for chat_id in self.cfg.chat_ids:
+                    # В журнале отмечаем то, что получилось на самом деле.
+                    self.store.log_incident(
+                        chat_id=chat_id, user_id=int(author_id), score=0,
+                        reason="отмечено владельцем как спам",
+                        action="ban" if self.cfg.may_ban else "delete",
+                        deleted=bool(removed), banned=banned_ok, text=text,
+                    )
+                    break
+
+            lines.append(f"\nВсего образцов: {self.store.count_samples()} · /samples")
+            self._pending = {}
+            await call.answer("Готово")
+            await call.message.answer("\n".join(lines))
             return
 
         if data.startswith("banuser:"):

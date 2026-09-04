@@ -769,3 +769,46 @@ def test_manual_covers_every_setting_and_rule_group():
     groups = set(rules["patterns"]) - {"contact_cta_standalone"}
     described = set(re.findall(r"`(\w+)`", manual))
     assert not groups - described, f"не описаны группы правил: {sorted(groups - described)}"
+
+
+def test_marking_spam_also_cleans_up():
+    """Кнопка «спам» должна и запоминать образец, и наводить порядок в чате."""
+    import inspect
+    from bot import main as bot_main
+
+    handler = inspect.getsource(bot_main.Moderator.on_button)
+    assert '"remember_text", "remember_only"' in handler
+    # Запоминает образец, удаляет сообщения автора, банит — всё по одной кнопке.
+    assert "add_sample" in handler
+    assert "_delete_previous" in handler
+    assert "ban_chat_member" in handler
+    # «Только запомнить» ничего не трогает.
+    assert 'data == "remember_text" and author_id' in handler
+    # Действия зависят от режима.
+    assert "self.cfg.may_delete" in handler and "self.cfg.may_ban" in handler
+    # Срабатывание попадает в журнал.
+    assert "log_incident" in handler
+
+
+def test_button_label_depends_on_mode():
+    """Подпись кнопки должна честно говорить, что произойдёт."""
+    import inspect
+    from bot import main as bot_main
+
+    source = inspect.getsource(bot_main.Moderator.on_private_text)
+    assert "удалить и заблокировать" in source   # боевой режим
+    assert "запомнить и удалить" in source       # мягкий
+    assert "Запомнить как спам" in source        # наблюдение или автор скрыт
+    # Защищённого отправителя не трогаем.
+    assert "is_protected" in source
+
+
+def test_journal_records_actual_result_not_intent():
+    """В журнал должно попадать то, что получилось, а не то, что задумывалось."""
+    import inspect
+    from bot import main as bot_main
+
+    handler = inspect.getsource(bot_main.Moderator.on_button)
+    assert "banned_ok" in handler, "результат блокировки не отслеживается"
+    assert "banned=banned_ok" in handler, "в журнал пишется намерение, а не результат"
+    assert "banned=self.cfg.may_ban" not in handler
