@@ -89,6 +89,27 @@ async def main() -> int:
                 "Group Privacy → Turn off, затем удалить и заново добавить бота в чат",
             )
 
+    # Антиспам самого Telegram — работает параллельно с ботом
+    for chat_id in cfg.chat_ids:
+        try:
+            chat = await bot.get_chat(chat_id)
+            count = await bot.get_chat_member_count(chat_id)
+        except TelegramAPIError:
+            continue
+        if chat.has_aggressive_anti_spam_enabled:
+            report(OK, "Антиспам Telegram включён", f"участников {count}, работает вместе с ботом")
+        elif count >= 200:
+            report(
+                WARN, "Антиспам Telegram выключен",
+                f"участников {count} — можно включить в настройках чата, "
+                "он ловит часть спама до бота",
+            )
+        else:
+            report(
+                WARN, "Антиспам Telegram недоступен",
+                f"участников {count}, нужно от 200",
+            )
+
     # Уведомления владельцу
     if cfg.admin_id is None:
         report(WARN, "ADMIN_ID не задан", "уведомления и управление недоступны")

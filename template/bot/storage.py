@@ -14,6 +14,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 DUPLICATE_WINDOW_SEC = 24 * 3600
+# Telegram не даёт ботам удалять сообщения старше 48 часов.
+MESSAGE_MEMORY_SEC = 47 * 3600
 # Насколько похожим должен быть текст, чтобы считаться тем же образцом спама.
 SAMPLE_SIMILARITY = 0.82
 MIN_SAMPLE_LEN = 20
@@ -56,6 +58,14 @@ class Storage:
                 preview  TEXT NOT NULL,
                 ts       INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_messages (
+                chat_id    INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                ts         INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_messages
+                ON user_messages(chat_id, user_id);
             CREATE TABLE IF NOT EXISTS known_users (
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -113,6 +123,45 @@ class Storage:
         )
         self.db.commit()
         return True
+
+    # ------------------------------- недавние сообщения участников
+
+    def remember_message(self, chat_id: int, user_id: int | None, message_id: int) -> None:
+        """Запоминает НОМЕР сообщения — без текста, только чтобы потом удалить.
+
+        Telegram позволяет удалять сообщения не старше 48 часов, поэтому
+        и хранить дольше смысла нет.
+        """
+        if user_id is None:
+            return
+        now = int(time.time())
+        self.db.execute(
+            "INSERT INTO user_messages(chat_id, user_id, message_id, ts) VALUES (?,?,?,?)",
+            (chat_id, user_id, message_id, now),
+        )
+        self.db.execute(
+            "DELETE FROM user_messages WHERE ts < ?", (now - MESSAGE_MEMORY_SEC,)
+        )
+        self.db.commit()
+
+    def user_message_ids(self, chat_id: int, user_id: int | None) -> list[int]:
+        """Номера сообщений участника, которые ещё можно удалить."""
+        if user_id is None:
+            return []
+        rows = self.db.execute(
+            "SELECT message_id FROM user_messages WHERE chat_id=? AND user_id=? AND ts > ?"
+            " ORDER BY message_id DESC",
+            (chat_id, user_id, int(time.time()) - MESSAGE_MEMORY_SEC),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def forget_user_messages(self, chat_id: int, user_id: int | None) -> None:
+        if user_id is None:
+            return
+        self.db.execute(
+            "DELETE FROM user_messages WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        )
+        self.db.commit()
 
     # ------------------------------------------------- образцы спама
 

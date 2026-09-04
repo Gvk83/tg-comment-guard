@@ -108,6 +108,7 @@ class Moderator:
         self._me_id: int | None = None
         self.paused = False
         self._warned: dict[str, float] = {}
+        self._native_antispam: bool | None = None
         self._register()
 
     # ------------------------------------------------------------ маршруты
@@ -311,6 +312,32 @@ class Moderator:
             keyboard=self._incident_buttons(user_id, banned=False),
         )
 
+    async def _delete_previous(
+        self, chat_id: int, user_id: int | None, current_id: int
+    ) -> int:
+        """Удаляет остальные сообщения участника за последние двое суток."""
+        ids = [m for m in self.store.user_message_ids(chat_id, user_id) if m != current_id]
+        if not ids:
+            return 0
+        removed = 0
+        # Telegram умеет удалять пачкой, но не больше ста за раз.
+        for chunk in (ids[i:i + 100] for i in range(0, len(ids), 100)):
+            try:
+                await self.bot.delete_messages(chat_id, chunk)
+                removed += len(chunk)
+            except TelegramAPIError:
+                # Пачкой не вышло — пробуем по одному, часть могла быть уже удалена.
+                for message_id in chunk:
+                    try:
+                        await self.bot.delete_message(chat_id, message_id)
+                        removed += 1
+                    except TelegramAPIError:
+                        pass
+        self.store.forget_user_messages(chat_id, user_id)
+        if removed:
+            log.info("Удалено прошлых сообщений участника %s: %s", user_id, removed)
+        return removed
+
     # ------------------------------------------------- основная проверка
 
     async def on_group_message(self, message: Message) -> None:
@@ -353,6 +380,10 @@ class Moderator:
         ):
             return
 
+        # Номер сообщения запоминаем всегда — включая те, что фильтр пропустил.
+        # Если человек окажется спамером, удалим всё, что он успел написать.
+        self.store.remember_message(message.chat.id, user_id, message.message_id)
+
         norm = normalize(text)
         is_reply_to_user = bool(
             message.reply_to_message
@@ -373,6 +404,7 @@ class Moderator:
             return
 
         deleted = banned = False
+        also_deleted = 0
         errors: list[str] = []
 
         if cfg.may_delete:
@@ -380,15 +412,27 @@ class Moderator:
                 await message.delete()
                 deleted = True
             except TelegramAPIError as e:
-                errors.append(f"удаление не удалось: {e}")
+                if "not found" in str(e).lower():
+                    # Обычно означает, что сообщение уже снял антиспам Telegram.
+                    deleted = True
+                    errors.append("сообщение уже было удалено (вероятно, антиспамом Telegram)")
+                else:
+                    errors.append(f"удаление не удалось: {e}")
+
+            # Убираем и всё, что этот человек успел написать раньше:
+            # фильтр мог пропустить его первые сообщения.
+            also_deleted = await self._delete_previous(message.chat.id, user_id, message.message_id)
 
         if verdict.action == "ban" and cfg.may_ban:
             try:
                 if user_id is not None:
-                    await self.bot.ban_chat_member(message.chat.id, user_id)
+                    await self.bot.ban_chat_member(
+                        message.chat.id, user_id, revoke_messages=True
+                    )
                 elif sender_chat_id is not None:
                     await self.bot.ban_chat_sender_chat(message.chat.id, sender_chat_id)
                 banned = True
+                self.store.forget_user_messages(message.chat.id, user_id)
             except TelegramAPIError as e:
                 errors.append(f"блокировка не удалась: {e}")
 
@@ -413,6 +457,8 @@ class Moderator:
         else:
             done = ("удалено" if deleted else "не удалено") + \
                    (", забанен" if banned else (", без бана" if verdict.action == "ban" else ""))
+            if also_deleted:
+                done += f", удалено прошлых сообщений: {also_deleted}"
 
         preview = html.escape(text.strip())[:300]
         await self._notify(
@@ -518,6 +564,11 @@ class Moderator:
 
     def _status_text(self) -> str:
         cfg = self.cfg
+        native = {
+            True: "включён",
+            False: "выключен",
+            None: "неизвестно",
+        }[self._native_antispam]
         return (
             (f"⏸ <b>Работа приостановлена</b>\n\n" if self.paused else "")
             + f"Режим: <b>{cfg.mode}</b> — {MODE_NAMES[cfg.mode]}\n"
@@ -530,7 +581,8 @@ class Moderator:
             f"Хранение текстов сработавших сообщений: "
             f"{'вкл' if cfg.store_message_text else 'выкл'}\n"
             f"Служебные сообщения о входе: "
-            f"{'удаляются' if cfg.delete_service_messages else 'остаются'}"
+            f"{'удаляются' if cfg.delete_service_messages else 'остаются'}\n"
+            f"Антиспам самого Telegram: {native}"
         )
 
     async def cmd_status(self, message: Message) -> None:
@@ -543,6 +595,7 @@ class Moderator:
         update_env(BASE_DIR / ".env", "MODE", mode)
         self.paused = False
         self._warned: dict[str, float] = {}
+        self._native_antispam: bool | None = None
         return f"Режим: <b>{mode}</b> — {MODE_NAMES[mode]}\nНастройка сохранена."
 
     async def cmd_mode(self, message: Message) -> None:
@@ -572,6 +625,7 @@ class Moderator:
             return
         self.paused = False
         self._warned: dict[str, float] = {}
+        self._native_antispam: bool | None = None
         await message.answer("▶️ Проверка возобновлена.", reply_markup=self._menu())
 
     async def cmd_restart(self, message: Message) -> None:
@@ -997,6 +1051,11 @@ class Moderator:
                 missing.append("удаление сообщений")
             if not getattr(me, "can_restrict_members", False):
                 missing.append("блокировка пользователей")
+            try:
+                chat = await self.bot.get_chat(chat_id)
+                self._native_antispam = chat.has_aggressive_anti_spam_enabled
+            except TelegramAPIError:
+                pass
             if missing:
                 await self._warn_once(
                     f"rights:{chat_id}",

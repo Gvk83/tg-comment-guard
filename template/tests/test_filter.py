@@ -15,6 +15,7 @@ from tests.samples import (  # noqa: E402
     CLEAN,
     CLEAN_TRICKY,
     SPAM,
+    SPAM_MISSED,
     SPAM_NEW_WORDING,
     SPAM_OBFUSCATED,
 )
@@ -624,3 +625,60 @@ def test_env_example_lists_every_setting():
         "DB_PATH", "LOG_LEVEL",
     ):
         assert f"{key}=" in env, f"{key} не описан в .env.example"
+
+
+# ------------------------------ пропущенное на боевом канале
+
+
+@pytest.mark.parametrize("text", SPAM_MISSED, ids=range(len(SPAM_MISSED)))
+def test_previously_missed_spam_is_caught(spam_filter, text):
+    """Эти сообщения бот пропустил в реальном чате — больше не должен."""
+    verdict = spam_filter.check(text)
+    assert verdict.action != "none", f"снова пропущено ({verdict.score}): {text[:60]}"
+
+
+def test_code_word_request_is_case_sensitive(spam_filter):
+    """«Пиши СКЛАД» — приём вербовки. «пишите в личку» — обычная просьба."""
+    assert "кодовое слово" in spam_filter.check("Есть работа. Пиши «СКЛАД».").reason_text
+    assert "кодовое слово" in spam_filter.check("Работа есть, напиши ПЛЮС").reason_text
+    assert "кодовое слово" not in spam_filter.check("Пишите в личку, отвечу").reason_text
+    assert "кодовое слово" not in spam_filter.check("Напишите мне пожалуйста").reason_text
+
+
+def test_payment_per_period_is_enough_context(spam_filter):
+    """«4300 ₽ за день» — объявление, даже без слов из словаря."""
+    v = spam_filter.check("Помощник кладовщика. 4300 ₽ за день. Есть обучение.")
+    assert v.action != "none"
+    # А обычная фраза с суммой без периода — не спам.
+    assert spam_filter.check("Заплатил за ремонт 45000 рублей").action == "none"
+
+
+def test_message_ids_are_remembered_for_cleanup(tmp_path):
+    """Номера сообщений хранятся без текста, чтобы удалить их при бане."""
+    store = Storage(tmp_path / "t.db")
+    for message_id in (11, 12, 13):
+        store.remember_message(-100, 55, message_id)
+    store.remember_message(-100, 66, 20)
+
+    assert store.user_message_ids(-100, 55) == [13, 12, 11]
+    assert store.user_message_ids(-100, 66) == [20]
+
+    # В таблице только номера — восстановить текст нельзя.
+    columns = [c[1] for c in store.db.execute("PRAGMA table_info(user_messages)")]
+    assert "text" not in columns and "sample" not in columns
+
+    store.forget_user_messages(-100, 55)
+    assert store.user_message_ids(-100, 55) == []
+    assert store.user_message_ids(-100, 66) == [20]
+    store.close()
+
+
+def test_ban_deletes_previous_messages():
+    """При бане бот должен убирать и прошлые сообщения спамера."""
+    import inspect
+    from bot import main as bot_main
+
+    source = inspect.getsource(bot_main.Moderator.on_group_message)
+    assert "_delete_previous" in source
+    assert "revoke_messages=True" in source
+    assert "remember_message" in source

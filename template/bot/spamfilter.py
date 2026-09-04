@@ -39,6 +39,17 @@ TELEGRAM_LINK_RE = re.compile(r"(t\.me/|telegram\.me/|@[a-z0-9_]{4,})")
 URL_RE = re.compile(r"https?://|www\.")
 SCHEDULE_RE = re.compile(r"(\b[2-7]\s?/\s?[1-3]\b|\b\d{1,2}[:.]\d{2}\s?[-–—]\s?\d{1,2}[:.]\d{2})")
 
+# «Пиши "СКЛАД"», «Напиши "+"» — приём вербовки: просят прислать кодовое слово.
+# Ищем в исходном тексте, потому что заглавные буквы здесь и есть признак.
+# Регистр здесь важен: кодовое слово пишут заглавными, поэтому
+# игнорировать регистр нельзя — иначе «пишите в личку» тоже совпадёт.
+CODE_WORD_RE = re.compile(
+    r"[Пп]иш\w*|[Нн]апиш\w*"
+)
+CODE_WORD_TAIL_RE = re.compile(
+    r"^\s*[«\"\'(]?\s*(?:\+|плюс\b|[А-ЯЁ]{3,}\b)"
+)
+
 # «Пиши» как самостоятельный призыв: отдельной строкой или в самом конце.
 STANDALONE_TAIL_RE = re.compile(r"(?:^|[\n.!,])\s*({words})\s*[.!)]*\s*$")
 
@@ -179,6 +190,9 @@ class SpamFilter:
                 add("money", f"сумма {amount}")
             if per_period:
                 add("money_per_period", "оплата за период")
+                # «4300 ₽ за день» — это уже объявление о работе, даже если
+                # других слов из словаря в сообщении нет.
+                hit_context = True
 
         # --- словарные группы
         for group, label in (
@@ -187,6 +201,7 @@ class SpamFilter:
             ("easy_money", "обещание лёгкого дохода"),
             ("send_material", "предлагает прислать материал в личные"),
             ("age_bait", "«без опыта» / возрастная приманка"),
+            ("slang_recruit", "жаргон вербовщиков"),
         ):
             found, only_squashed = self._find(group, norm, sq, may_be_obfuscated)
             if found:
@@ -194,6 +209,14 @@ class SpamFilter:
                 obfuscated = obfuscated or only_squashed
                 if group in self.context_required:
                     hit_context = True
+
+        # --- «Пиши "СКЛАД"» — просят прислать кодовое слово
+        if any(
+            CODE_WORD_TAIL_RE.match(text[m.end():])
+            for m in CODE_WORD_RE.finditer(text)
+        ):
+            add("code_word", "просят прислать кодовое слово")
+            hit_context = True
 
         # --- одиночное «Пиши» в конце сообщения
         if "призыв написать в личные" not in v.reasons and self._standalone_re.search(norm):
