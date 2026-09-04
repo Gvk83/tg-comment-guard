@@ -682,3 +682,90 @@ def test_ban_deletes_previous_messages():
     assert "_delete_previous" in source
     assert "revoke_messages=True" in source
     assert "remember_message" in source
+
+
+# --------------------------- добавление образца пересылкой
+
+
+def test_forwarded_message_handler_is_registered_last():
+    """Разбор пересылок не должен перехватывать команды и кнопки."""
+    from bot import main as bot_main
+    from bot.config import Config
+    from aiogram import Dispatcher
+
+    moderator = bot_main.Moderator.__new__(bot_main.Moderator)
+    moderator.cfg = Config(token="1:t")
+    moderator.dp = Dispatcher()
+    moderator._register()
+    names = [h.callback.__name__ for h in moderator.dp.message.handlers]
+
+    assert "on_private_text" in names
+    # Все команды и кнопки разбираются раньше.
+    last = names.index("on_private_text")
+    for earlier in ("cmd_start", "cmd_status", "cmd_spam", "on_reply_button"):
+        assert names.index(earlier) < last, f"{earlier} перехватывается разбором текста"
+    # А сообщения из группы он не трогает вовсе.
+    assert names.index("on_group_message") > last or "on_group_message" in names
+
+
+def test_sample_buttons_are_wired():
+    """Кнопки «Запомнить как спам» и «Заблокировать автора» обработаны."""
+    import inspect
+    from bot import main as bot_main
+
+    handler = inspect.getsource(bot_main.Moderator.on_button)
+    assert '"remember_text"' in handler
+    assert '"banuser:"' in handler
+
+    sender = inspect.getsource(bot_main.Moderator.on_private_text)
+    assert "remember_text" in sender
+    assert "forward_origin" in sender
+    # Защищённых пользователей блокировать не предлагаем.
+    assert "is_protected" in sender
+
+
+def test_manual_covers_every_command():
+    """Руководство должно описывать все команды, которые есть в боте."""
+    import re
+    from pathlib import Path
+    from aiogram import Dispatcher
+    from bot import main as bot_main
+    from bot.config import Config
+
+    manual = (Path(__file__).resolve().parent.parent / "РУКОВОДСТВО.md").read_text(
+        encoding="utf-8"
+    )
+
+    moderator = bot_main.Moderator.__new__(bot_main.Moderator)
+    moderator.cfg = Config(token="1:t")
+    moderator.dp = Dispatcher()
+    moderator._register()
+
+    registered = set()
+    for handler in moderator.dp.message.handlers:
+        for flt in handler.filters or ():
+            registered.update(getattr(flt.callback, "commands", None) or ())
+
+    described = set(re.findall(r"`/(\w+)", manual))
+    missing = registered - described - {"wl", "help"}   # /wl и /help — синонимы
+    assert not missing, f"не описаны в руководстве: {sorted(missing)}"
+
+
+def test_manual_covers_every_setting_and_rule_group():
+    """И все настройки, и все группы правил."""
+    import re
+    import yaml
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent
+    manual = (base / "РУКОВОДСТВО.md").read_text(encoding="utf-8")
+
+    settings = set(re.findall(r"^([A-Z_]+)=", (base / ".env.example").read_text(encoding="utf-8"), re.M))
+    assert not settings - set(re.findall(r"`([A-Z_]+)`", manual)), (
+        f"не описаны настройки: {sorted(settings - set(re.findall(r'`([A-Z_]+)`', manual)))}"
+    )
+
+    rules = yaml.safe_load((base / "bot" / "rules.yml").read_text(encoding="utf-8"))
+    groups = set(rules["patterns"]) - {"contact_cta_standalone"}
+    described = set(re.findall(r"`(\w+)`", manual))
+    assert not groups - described, f"не описаны группы правил: {sorted(groups - described)}"

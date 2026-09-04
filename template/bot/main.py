@@ -109,6 +109,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
+        self._pending_sample: str = ""
         self._register()
 
     # ------------------------------------------------------------ маршруты
@@ -147,6 +148,10 @@ class Moderator:
             private_admin,
             F.text.in_({BTN_STATUS, BTN_STATS, BTN_LAST, BTN_SAMPLES, BTN_MODE, BTN_HELP}),
         )
+        # Любой другой текст или пересылка в личке — разбор сообщения.
+        # Регистрируем последним, чтобы не перехватывать команды и кнопки.
+        dp.message.register(self.on_private_text, private_admin)
+
         dp.callback_query.register(self.on_button)
 
         group = F.chat.type.in_({"group", "supergroup"})
@@ -515,6 +520,8 @@ class Moderator:
         "/resume — возобновить\n"
         "/restart — перезапустить бота\n\n"
         "<b>Образцы спама</b>\n"
+        "Перешлите мне сюда любое сообщение — разберу его и предложу\n"
+        "запомнить как образец. Это самый быстрый способ.\n"
         "/samples — сохранённые образцы\n"
         "/spam текст — запомнить образец вручную\n"
         "/delsample 5 — удалить образец\n"
@@ -596,6 +603,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
+        self._pending_sample: str = ""
         return f"Режим: <b>{mode}</b> — {MODE_NAMES[mode]}\nНастройка сохранена."
 
     async def cmd_mode(self, message: Message) -> None:
@@ -626,6 +634,7 @@ class Moderator:
         self.paused = False
         self._warned: dict[str, float] = {}
         self._native_antispam: bool | None = None
+        self._pending_sample: str = ""
         await message.answer("▶️ Проверка возобновлена.", reply_markup=self._menu())
 
     async def cmd_restart(self, message: Message) -> None:
@@ -943,6 +952,60 @@ class Moderator:
         elif text == BTN_HELP:
             await message.answer(self.HELP_TEXT)
 
+    async def on_private_text(self, message: Message) -> None:
+        """Разбирает сообщение, которое владелец прислал или переслал в личку.
+
+        Так удобнее всего добавлять пропущенный спам: не нужно копировать
+        текст в команду — достаточно переслать само сообщение.
+        """
+        if not self._is_owner(message):
+            return
+        text = message.text or message.caption or ""
+        hidden = self._hidden_links(message)
+        if not text.strip() and not hidden:
+            await message.answer(
+                "Пришлите текст или перешлите сюда сообщение из чата — "
+                "разберу его и предложу запомнить как образец спама."
+            )
+            return
+
+        verdict = self.filter.check(
+            text,
+            hidden_links=hidden,
+            is_forwarded=message.forward_origin is not None,
+            known_spam=self.store.match_sample(normalize(text)),
+        )
+        decision = {
+            "none": "пропустил бы",
+            "delete": "удалил бы без блокировки",
+            "ban": "удалил бы и заблокировал",
+        }[verdict.action]
+
+        delete_at = self.filter.thresholds["delete"]
+        gap = ""
+        if verdict.action == "none":
+            gap = f"\nНе хватило баллов: {delete_at - verdict.score}"
+
+        # Автор пересланного сообщения виден, только если он не скрыл профиль.
+        origin = message.forward_origin
+        author_id = getattr(getattr(origin, "sender_user", None), "id", None)
+
+        rows = [[InlineKeyboardButton(
+            text="🚫 Запомнить как спам", callback_data="remember_text"
+        )]]
+        if author_id and not self.is_protected(author_id, set()):
+            rows.append([InlineKeyboardButton(
+                text="🔨 Заблокировать автора", callback_data=f"banuser:{author_id}"
+            )])
+        self._pending_sample = text
+
+        await message.answer(
+            f"Баллы: <b>{verdict.score}</b> из {delete_at} нужных\n"
+            f"Решение: <b>{decision}</b>{gap}\n"
+            f"Признаки: {html.escape(verdict.reason_text)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
     # ------------------------------------------------------------- кнопки
 
     async def on_button(self, call: CallbackQuery) -> None:
@@ -950,6 +1013,44 @@ class Moderator:
             await call.answer("Недоступно", show_alert=True)
             return
         data = call.data or ""
+
+        if data == "remember_text":
+            text = getattr(self, "_pending_sample", "")
+            if not text:
+                await call.answer("Текст потерялся, пришлите заново", show_alert=True)
+                return
+            added = self.store.add_sample(normalize(text), text)
+            await call.answer("Запомнил" if added else "Такой образец уже есть")
+            if added:
+                await call.message.answer(
+                    "🚫 Образец сохранён. Похожие сообщения теперь будут удаляться "
+                    f"сразу.\n\nВсего образцов: {self.store.count_samples()}\n"
+                    "Посмотреть: /samples"
+                )
+            else:
+                await call.message.answer(
+                    "Такой образец уже сохранён — похожие сообщения и так удаляются.\n"
+                    "Если это сообщение всё равно проходит, пришлите его мне, "
+                    "и я подскажу, какого признака не хватает."
+                )
+            return
+
+        if data.startswith("banuser:"):
+            user_id = int(data.split(":", 1)[1])
+            lines = []
+            for chat_id in self.cfg.chat_ids:
+                try:
+                    await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
+                    removed = await self._delete_previous(chat_id, user_id, 0)
+                    lines.append(
+                        f"Заблокирован в чате {chat_id}"
+                        + (f", удалено сообщений: {removed}" if removed else "")
+                    )
+                except TelegramAPIError as e:
+                    lines.append(f"Чат {chat_id}: {e}")
+            await call.answer("Готово")
+            await call.message.answer(html.escape("\n".join(lines)))
+            return
 
         if data.startswith("remember:"):
             incident_id = int(data.split(":", 1)[1])
